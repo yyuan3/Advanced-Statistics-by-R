@@ -1,0 +1,357 @@
+---
+title: "Final-PUBG"
+author: "Ye Yuan"
+date: "12/17/2019"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: darkly
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyr)
+library(ggplot2)
+library(merTools)
+library(pwr)
+library(dplyr)
+library(DT); library(broom)
+library(caret)
+library(visNetwork)
+library(data.table)
+library(dplyr)
+library(ggplot2)
+library(Matrix)
+library(xgboost)
+library(interactions)
+library(effects)
+```
+
+# ● Data Chosen and Explaination
+## Data Chosen
+PUBG (Playerunknown’s Battlegrounds) is the most popular game in the world and also my favourite game. I am very interested in the relationship between how the player performs in the game and the final results(winPlacePerc). The goal of the analysis is to choose which feature or variable will influence the rank of the player.
+
+```{r}
+pubg <- read.csv("PUBG.csv")
+```
+```{r}
+pubg1 <- pubg %>% 
+  select(Id,matchId,assists,boosts,damageDealt,headshotKills,heals,kills,matchDuration,matchType,revives,teamKills,rideDistance,swimDistance,walkDistance,weaponsAcquired,winPlacePerc)
+pubg1 <- na.omit(pubg1)
+```
+
+## Variable Explaination
+boosts - Number of boost items used.(Energy Drink,Painkiller,Adrenaline Syringe)
+
+damageDealt - Total damage dealt. Note: Self inflicted damage is subtracted.
+
+headshotKills - Number of enemy players killed with headshots.
+
+heals - Number of healing items used.(Bandage,First Aid Kit,Med Kit)
+
+matchType - String identifying the game mode that the data comes from. The standard modes are “solo”, “duo”, “squad”, “solo-fpp”, “duo-fpp”, and “squad-fpp”; other modes are from events or custom matches.
+
+rideDistance - Total distance traveled in vehicles measured in meters.
+
+swimDistance - Total distance traveled by swimming measured in meters.
+
+walkDistance - Total distance traveled on foot measured in meters.
+
+weaponsAcquired - Number of weapons picked up.(Guns and Bullets)
+
+*winPlacePerc - The target of prediction. This is a percentile winning placement, where 1 corresponds to 1st place, and 0 corresponds to last place in the match. It is calculated off of maxPlace, not numGroups, so it is possible to have missing chunks in a match.
+
+
+# ● Data Exploration
+
+## Data type
+```{r}
+str(pubg1)
+```
+
+## Corrplor relationship
+```{r}
+pubgcorr <-pubg %>%
+  select(assists,boosts,damageDealt,headshotKills,heals,kills,matchDuration,revives,teamKills,rideDistance,swimDistance,walkDistance,weaponsAcquired,winPlacePerc)
+```
+
+```{r}
+pubgcorr <- na.omit(pubgcorr)
+```
+
+```{r}
+pubgcorr = cor(pubgcorr[,])
+knitr::kable(round(pubgcorr, 2))
+corrplot::corrplot.mixed(pubgcorr, lower = "number", upper = "square", order = "hclust")
+```
+
+WalkDistance(0.81),boosts(0.63),weaponsAcquired(0.58),damageDealt(0.44),heals(0.43),kills(0.42),rideDistance(0.34) are most related to the final winPlacePrec.
+
+We can try to group these variables:
+
+1.Distance: walkDistance,rideDistance
+
+2.Shooting skills: kills,damageDealt 
+
+3.Resources collection:boosts,weaponsAcquired,heals.
+
+
+# ● Finding 1: Distance
+Distance maters a lot,so want to see the relationship with match ranking and distance travelled.
+
+## Analysis
+First, I group the three kinds of moving methods (walk,ride,swim) and calculate their average distance. At the same time, I divide the winPlacePerc into percentage by 10% intervals.
+```{r}
+# group win placement into decile groups
+dist <- pubg1 %>% 
+  mutate(winPlacePerc_decile = ntile(winPlacePerc, 10)) %>%
+  group_by(winPlacePerc_decile) %>%
+  summarise(walk = mean(walkDistance),
+            ride = mean(rideDistance),
+            swim = mean(swimDistance)) %>%
+  ungroup() %>%
+  melt(., measure.vars = c('walk', 'ride', 'swim'),
+       variable.name = 'travel_mode', value.name = 'avg_distance') %>%
+  as.data.table()
+dist
+```
+
+Then,I plot bar chart and line graph to show the relationship between travelling methods and the winplaceperc.
+```{r}
+# factor decile groups and plot barchart
+lvls <- dist$winPlacePerc_decile %>% unique() %>% sort()
+dist$winPlacePerc_decile <- factor(dist$winPlacePerc_decile, levels = lvls)
+ggplot(data = dist, aes(x = winPlacePerc_decile, y = avg_distance, fill = travel_mode)) +
+  geom_bar(stat = 'identity', position = 'dodge') +
+  facet_grid(travel_mode ~ ., scales = 'free') +
+  labs(title = 'Travel Distance by Placement Decile')
+```
+
+
+```{r}
+ggplot(data = pubg1, aes(x=winPlacePerc)) +
+  geom_smooth(aes(y = walkDistance,color = 'red')) + 
+  geom_smooth(aes(y = rideDistance,color = 'green'))+
+  geom_smooth(aes(y = swimDistance, color = 'blue'))+
+  labs(x = "WinPlacePerc",
+         y = "Distance",
+       title = 'Travel Distance | WinPlacePerc')+
+  scale_color_identity(name = "travel_mode",
+                          breaks = c("red","green","blue"),
+                          labels = c("walk", "ride", "swim"),
+                          guide = "legend")
+```
+
+## Conclusion
+
+1. The average distance travelled consistently increases with the player’s placement decile. In short, the better player you are, the further your distance travelled.
+
+2. Walking is always the first choice, which is much better than Riding and Swimming during the game.  
+
+# ● Finding 2: Sharpshoot skills
+
+We know shooting skills are very important to the player, which will directly lead to win the final game. To measure players' shooting skill, headshot accuracy is the best way to measure that headshot accuracy = headshotKills / kills.
+
+## Analysis
+
+```{r}
+sharpshoot <- pubg %>%
+  select(Id, headshotKills, kills, winPlacePerc,matchType) %>%
+  mutate(winPlacePerc = round(winPlacePerc, 2)) %>%
+  group_by(winPlacePerc) %>%
+  summarise(headshot_accuracy = mean(ifelse(kills == 0, 0, headshotKills / kills))) 
+
+
+ggplot(data = sharpshoot, aes(x = winPlacePerc, y = headshot_accuracy)) +
+  geom_point() +
+  geom_smooth(method = 'loess') +
+  labs(title = 'The Sharpshooter')
+```
+
+From the plot, we can easily see higher accuracy leads to higher winPlacePerc. 
+But here is the question, does match type will influence the result? 
+From my experience, I am a bad shooter, when I attend solo match, I probably will choose to hide and run on most of time and finally I also can will the game.
+Then I will exam it through ploting the model by different match type.
+
+First, I will change the match type name into 6 groups(crash,flare,solo,duo,squad).
+
+
+```{r, echo = FALSE}
+sharpshootbymatchtype <- pubg %>%
+  select(Id, headshotKills, kills, winPlacePerc,matchType) %>%
+  mutate(winPlacePerc = round(winPlacePerc, 2)) %>%
+  group_by(winPlacePerc,matchType) %>%
+  summarise(headshot_accuracy = mean(ifelse(kills == 0, 0, headshotKills / kills)))
+
+sharpshootbymatchtype <- sharpshootbymatchtype%>%
+  mutate(matchType = as.character(matchType))%>%
+  mutate(matchType = if_else((matchType=='crashfpp')|(matchType=='crashtpp'),'crash',matchType))%>%
+  mutate(matchType = if_else((matchType=='flarefpp')|(matchType=='flaretpp'),'flare',matchType))%>%
+  mutate(matchType = if_else((matchType=='normal-solo-fpp')|(matchType=='solo-fpp')|(matchType=='normal-solo'),'solo',matchType))%>%
+  mutate(matchType = if_else((matchType=='duo-fpp')|(matchType=='normal-duo')|(matchType=='normal-duo-fpp'),'solo',matchType))%>%
+  mutate(matchType = if_else((matchType=='squad-fpp')|(matchType=='normal-squad')|(matchType=='normal-squad-fpp'),'squad',matchType))%>%
+  mutate(matchType = as.factor(matchType))
+
+ggplot(data = sharpshootbymatchtype, aes(x = winPlacePerc, y = headshot_accuracy,color = matchType)) +
+  geom_smooth(method = 'loess') +
+  labs(title = 'The Sharpshooter by match type')
+```
+
+I am totally wrong! Except for the crash, other groups' final winPercent are all related to the headshot accuracy. Maybe win by hiding is just by chance to me.
+
+## Random slopes and intercept influence
+```{r, echo = FALSE}
+riMod <- lmer(winPlacePerc~headshot_accuracy+(1+headshot_accuracy|matchType),data =sharpshootbymatchtype)
+summary(riMod) 
+```
+From std.Dev, we can see headshot accuracy cofficient change 2.4317 by different types of match, but intercept doesn't change a lot.
+
+From t value, intercept> 1.96 means it is significant. But for cofficient, it just very close.
+
+
+We can see the std of intercept = 0.2218, so headshot accuracy just change intercept by matchtype by 0.2218. Also change headshot accuracy's cofficient by matchtype by 0.8698. 
+
+So when we see the fixed effects, we see intercept's t-value = 2.980, which is significant, then for cofficient = 1.621 which is not significant,which means matchtype do not fit the headshot_accuacy's cofficient.
+
+
+
+## Conclusion
+
+1. Higher head_shot accuacy leads to higher final grade.
+2. Shooting skills is very important in all kinds of games except for crash.
+
+
+
+
+# ● Finding 3: Resources collection
+
+Here is the question:  When we farm in the jungle or city, how do I make the strategy of resource collection? 
+
+Do I need to collect weapons first, boost, or the heals? 
+
+## Analysis
+
+```{r}
+ggplot(data = pubg1, aes(x = winPlacePerc)) +
+  geom_smooth(aes(y = boosts,color = 'red')) + 
+  geom_smooth(aes(y = weaponsAcquired, color = 'green'))+
+  geom_smooth(aes(y = heals, color = 'blue'))+
+  labs(x = "WinPlacePerc",
+         y = "Resources",
+         colors = "Legend",
+       title = 'Resources collection | WinPlacePerc') +
+  scale_color_identity(name = "travel_mode",
+                          breaks = c("red","green","blue"),
+                          labels = c("boosts", "weaponsAcquired", "heals"),
+                          guide = "legend")
+```
+
+Noramlly, weapons are the most important thing to win the final fight, the trend of boosts and heal are almost the same.
+But does the matchtype will influence our strategies? 
+
+## Interactions
+
+Now, we put matchtype and different kinds of resources together into linear model to exam their interaction performances.
+
+```{r}
+resources <- pubg1%>%
+  select(boosts,heals,weaponsAcquired,winPlacePerc,matchType)%>%
+  mutate(matchType = as.character(matchType))%>%
+  mutate(matchType = if_else((matchType=='crashfpp')|(matchType=='crashtpp'),'crash',matchType))%>%
+  mutate(matchType = if_else((matchType=='flarefpp')|(matchType=='flaretpp'),'flare',matchType))%>%
+  mutate(matchType = if_else((matchType=='normal-solo-fpp')|(matchType=='solo-fpp')|(matchType=='normal-solo'),'solo',matchType))%>%
+  mutate(matchType = if_else((matchType=='duo-fpp')|(matchType=='normal-duo')|(matchType=='normal-duo-fpp'),'solo',matchType))%>%
+  mutate(matchType = if_else((matchType=='squad-fpp')|(matchType=='normal-squad')|(matchType=='normal-squad-fpp'),'squad',matchType))%>%
+  mutate(matchType = as.factor(matchType))%>%
+  mutate(boosts = as.numeric(boosts))%>%
+  mutate(heals = as.numeric(heals))
+
+```
+
+
+
+```{r}
+weaponmod <- lm(winPlacePerc~ weaponsAcquired*matchType,data = resources)
+summary(weaponmod)
+weaponmodplot <- interact_plot(weaponmod,pred = weaponsAcquired,modx = matchType)
+weaponmodplot
+```
+
+From weaponmod summary, we can see p value of weaponsAcquired: matchTypesquad, weaponsAcquired:matchTypesolo,weaponsAcquired:matchTypeflare is significant, so we should divide the weaponsAcquired inforamtion by different match type.
+```{r}
+boostsmod <- lm(winPlacePerc~ boosts*matchType,data = resources)
+summary(boostsmod)
+boostsmodplot <- interact_plot(boostsmod,pred = boosts,modx = matchType)
+boostsmodplot
+```
+
+From boostsmod summary, we can see only p value of weaponsAcquired:matchTypesquad is significant, so there is no difference between the match type.
+
+```{r}
+healsmod <- lm(winPlacePerc~ heals*matchType,data = resources)
+summary(healsmod)
+healsmodplot <- interact_plot(healsmod,pred = heals,modx = matchType)
+healsmodplot
+```
+From healsmod summary, we can see no p value in any combination of heals and match type.
+
+
+## Conclusion:
+
+1. Compared to the boosts and heals,weapons are the first to collect.The better your weapon, the more likely you will win the final.
+
+2. The importance of weapons in crash match is higher than other matches.
+
+3. Boosts and Heals has almost the same influence to the winPlacePerc.
+
+
+# ● Finding Summary
+
+1. The better player you are, the further your distance travelled. Travel priority: Walk > Ride >Swim.
+
+2. Better shooting skills leads to final.
+
+3. Weapon resources are the most important thing to collect.
+
+
+
+
+
+
+
+
+
+
+
+# Winner Winner, Chicken Dinner
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
